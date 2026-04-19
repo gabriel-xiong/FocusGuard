@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EarnedIt</string>
+    <string name="accessibility_description">EarnedIt monitors which app is in the foreground to block distracting apps during study sessions.</string>
+    <string name="accessibility_service_description">Blocks selected distracting apps during active EarnedIt focus sessions.</string>
+</resources>
