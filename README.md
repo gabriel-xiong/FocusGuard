@@ -77,7 +77,7 @@ Calibration answers "what does normal study posture look like for this user and 
 
 ### Attention Scoring
 
-The scorer lives in `app/src/main/java/com/focusguard/session/AttentionScorer.kt`.
+The scorer lives in `app/src/main/java/com/focusguard/session/AttentionScorer.kt`
 
 A signal is distracted when:
 
