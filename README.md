@@ -1,390 +1,189 @@
 # FocusGuard
 
-FocusGuard is an Android study app that helps students protect focus time. The app runs on-device computer vision during a focus session, estimates whether the user is still studying, pauses the session when attention is lost, and blocks distracting apps until the user returns to FocusGuard.
+FocusGuard is an Android study app that protects a focus session with fully on-device attention sensing. A three-model LiteRT pipeline estimates face presence, head pose, and eye state; the session state machine pauses distracted time; and an Accessibility Service blocks selected apps until the student returns.
 
-## Application Description
+The product UI is currently branded **EarnedIt**. Camera frames used for attention detection remain on the device, and the core focus flow does not require a network connection.
 
-FocusGuard turns focused study into a protected, rewarded session:
+## At a glance
 
-- The student selects a study duration.
-- The student selects distracting apps to block.
-- The front camera activates only during the active focus session.
-- Three LiteRT models run locally to detect face presence, face landmarks, eye openness, and gaze direction.
-- The app calibrates to the student's normal study posture for the first 45 detected-face frames.
-- If the student keeps studying, the timer counts down normally.
-- If the student looks away, leaves frame, closes their eyes, or produces low-confidence vision signals, the timer pauses.
-- If the student opens a blacklisted app, an Accessibility Service immediately returns them to EarnedIt.
-- Completing focus time unlocks a reward window and feeds a pet/progression system.
+| | |
+|---|---|
+| **Core challenge** | Turn noisy mobile vision signals into a fair, real-time focus decision |
+| **ML pipeline** | Face detection → 468-point landmarks → eye/gaze estimation → calibrated attention score |
+| **Runtime** | Google LiteRT with automatic NPU → GPU → CPU fallback |
+| **Measured result** | Threshold tuning reduced training-set false negatives from 116 to 57; held-out rolling-window agreement reached 92.7% |
+| **Stack** | Kotlin, Jetpack Compose, CameraX, LiteRT, Coroutines, DataStore |
+| **Privacy boundary** | Inference and calibration run locally; optional social data is separate in Supabase |
 
-No camera frame needs to leave the device for attention detection. Optional social features use Supabase only for profile/friend data when configured.
+## System architecture
 
-## Features And Functionality
+```mermaid
+flowchart LR
+    C[CameraX front camera] --> P[Rotate, mirror, normalize]
+    P --> F[Face detector]
+    F --> L[468-point face landmarks]
+    L --> E[Eye crop + gaze model]
+    L --> H[Head-pose estimate]
+    E --> A[Calibrated AttentionSignal]
+    H --> A
+    A --> S[AttentionScorer]
+    S --> M[SessionManager state machine]
+    M --> U[Compose UI + timer]
+    M --> B[Accessibility app blocker]
+    M --> R[Rewards + pet progression]
 
-### Focus Sessions
-
-- Duration-based focus sessions.
-- Session phases: `Idle`, `FocusActive`, `RewardActive`, `Paused`, `Failed`, and `Complete`.
-- Per-session focus score from `0.0` to `1.0`.
-- Focused seconds and distracted seconds tracking.
-- Timer freezes during calibration and pauses while distracted.
-- Reward window after successful focus completion.
-
-### On-Device ML Attention Detection
-
-The ML pipeline is in `app/src/main/java/com/focusguard/ml`.
-
-```text
-CameraX front camera
-    -> rotate and mirror frame
-    -> face_detector.tflite
-    -> face crop
-    -> face_landmark_detector.tflite
-    -> eye landmarks, eye aspect ratio, eye crop
-    -> eyegaze.tflite
-    -> pitch/yaw in radians
-    -> pitch/yaw in degrees
-    -> calibration baseline subtraction
-    -> AttentionSignal
-    -> AttentionScorer
-    -> SessionManager
-    -> Compose UI and app-blocking service
+    N[NPU] -. fallback .-> G[GPU]
+    G -. fallback .-> X[CPU]
+    N --> F
+    N --> L
+    N --> E
 ```
 
-The app ships three frozen `.tflite` models:
+## Engineering highlights
 
-- `face_detector.tflite`: detects the face and produces bounding boxes/confidence.
-- `face_landmark_detector.tflite`: extracts 468 facial landmarks.
-- `eyegaze.tflite`: estimates gaze pitch and yaw from the eye crop.
+### A pipeline designed for mobile failure modes
 
-Model execution uses Google LiteRT `CompiledModel`. `FallbackCompiledModel` tries accelerators in this order:
+The app ships three frozen `.tflite` assets:
 
-```text
-NPU -> GPU -> CPU
-```
+- `face_detector.tflite` finds the face and returns confidence and bounds;
+- `face_landmark_detector.tflite` produces 468 landmarks for pose and eye geometry;
+- `eyegaze.tflite` estimates gaze pitch and yaw from the eye crop.
 
-The fallback applies to model creation and runtime inference. If an accelerator fails during `run(...)`, the wrapper recreates model buffers on the next accelerator, rewrites the input, and retries.
+`FallbackCompiledModel` attempts NPU, GPU, and CPU execution in order. Fallback covers both model creation and inference: if an accelerator fails during `run(...)`, the wrapper recreates buffers on the next backend, rewrites the input, and retries. Reliability is favored over assuming that one delegate works across Android devices.
 
-### Calibration
+### Per-session calibration before classification
 
-When a focus session starts:
+A fixed head-pose threshold was unfair when phone placement or a student's natural reading posture changed. FocusGuard therefore freezes the timer for the first 45 detected-face frames, averages the neutral yaw and pitch, and scores later observations relative to that baseline.
 
-- the first 45 detected-face frames are used for calibration,
-- raw yaw and pitch are averaged,
-- the focus timer is frozen,
-- later yaw/pitch values are baseline-subtracted.
+The final decision also fails closed on missing faces, low-confidence landmarks, unreliable eye signals, or closed eyes. Raw predictions are aggregated into a smoothed signal before scoring, so the product does not treat every camera frame as an independent decision.
 
-Calibration answers "what does normal study posture look like for this user and phone position?" before scoring begins.
+### Explicit state instead of timer side effects
 
-### Attention Scoring
+`SessionManager` owns the phases `Idle`, `FocusActive`, `RewardActive`, `Paused`, `Failed`, and `Complete`. Calibration time does not reduce the study timer; distracted time is recorded separately; and a completed session opens a bounded reward window.
 
-The scorer lives in `app/src/main/java/com/focusguard/session/AttentionScorer.kt`
+This state boundary keeps camera inference, the countdown, app blocking, and UI rendering from independently deciding what the session means.
 
-A signal is distracted when:
+### Guarded app blocking
 
-- no face is detected,
-- face confidence or landmark/eye confidence is too low,
-- calibrated yaw/pitch is outside the tuned focus zone,
-- eye aspect ratio indicates eyes closed.
+`FocusAccessibilityService` observes foreground-window changes only while a focus session is active. A blacklisted app returns the user to EarnedIt and records the attempt, but the service intentionally excludes:
 
-The tuned focus zone is:
+- EarnedIt itself;
+- Android system UI and settings;
+- the emergency dialer;
+- the reward window;
+- duplicate rapid events from the same package.
 
-```kotlin
-yaw in -25.0..20.0 && pitch in -15.0..18.0
-```
+The accessibility service is a powerful Android capability, so its scope is kept narrow and testable. Manual QA guidance lives in [`docs/accessibility-service-qa.md`](docs/accessibility-service-qa.md).
 
-This range is asymmetric by design. Calibration recenters the user's neutral posture, while threshold tuning defines how much natural movement is acceptable around that center. Labeled data showed that real focused study behavior included more downward reading posture and slight leftward glances than a symmetric threshold allowed.
+### Instrumentation built into the inference path
 
-### App Blocking
+Debug builds can capture per-stage inference timing, p50/p95/p99 summaries, FPS, memory pressure, garbage collection, and thermal state. An opt-in quality mode samples frames with JSON sidecars containing confidences, pose, calibration offsets, eye geometry, and the final focus decision.
 
-`FocusAccessibilityService` watches foreground-window changes while a session is active. If the foreground app is blacklisted, EarnedIt is relaunched and the blocked attempt is recorded.
+Those artifacts make performance or delegate changes testable against the same quality data instead of relying on visual inspection.
 
-The service intentionally ignores:
+## Evaluation: tuning the decision rule, not the models
 
-- EarnedIt itself,
-- Android/system UI/settings packages,
-- the emergency dialer,
-- reward windows,
-- duplicate rapid-fire events from the same app.
+All three models remained frozen. The change was to the decision boundary above their outputs.
 
-### Pet, Rewards, Insights, And Social
-
-The product layer includes:
-
-- onboarding and pet selection,
-- home dashboard with pet progress,
-- pet evolution and cosmetics,
-- feeding/play/encouragement interactions,
-- session results,
-- insights screens,
-- optional social profiles and friend requests through Supabase.
-
-Local app state is handled by `EarnedItStore`. Supabase schema is in `supabase/social_schema.sql`.
-
-### Debug And Quality Tools
-
-Instrumentation lives in `app/src/main/java/com/focusguard/instrumentation`.
-
-- `BenchmarkRegistry`: per-stage timing.
-- `BenchmarkReporter`: JSON benchmark reports with p50, p95, p99, mean, samples, memory, FPS, and thermal status.
-- `SystemMetricsSampler`: memory, GC pressure, frame count, FPS, and thermal tracking.
-- `QualityCaptureManager`: opt-in recording mode that saves every fifth frame as JPEG plus sidecar JSON.
-- `DebugInstrumentationState`: debug switches for recording mode and frame stamping.
-
-Captured sidecars include face confidence, bounding box, landmark score, raw yaw/pitch, calibration baseline, baseline-subtracted yaw/pitch, eye landmarks, focused-zone decision, session score, timestamp, and a label field for offline annotation.
-
-## Fine-Tuning Process
-
-We started with an off-the-shelf head-pose-based focus detector that produced too many false negatives: the timer paused unfairly during normal studying. We did not retrain any model. All three models stayed frozen; only the decision rule on top of model outputs was tuned.
-
-Original rule:
+A six-minute scripted session produced 664 human-labeled frames with a 0.5-second transition buffer. The original symmetric rule rejected too much normal downward reading:
 
 ```kotlin
 abs(yaw) < 20.0 && abs(pitch) < 15.0
 ```
 
-Training session:
-
-- 6 minutes,
-- scripted focused and distracted segments,
-- 664 captured frames,
-- human frame labels,
-- 0.5-second transition buffer around segment boundaries.
-
-Original-rule performance:
-
-| Metric | Original rule |
-| --- | ---: |
-| Overall agreement | 79.3% |
-| Focused recall | 73.4% |
-| Distraction recall | 96.6% |
-| False negatives | 116 |
-
-Error analysis showed that 79% of false negatives failed only the pitch threshold. Median false-negative pitch was 17.3 degrees, which matched natural downward reading posture.
-
-Final tuned rule:
+Error analysis showed that 79% of false negatives failed only the pitch threshold; their median pitch was 17.3°. The tuned asymmetric rule became:
 
 ```kotlin
 yaw in -25.0..20.0 && pitch in -15.0..18.0
 ```
 
-Training-session improvement:
+| Metric | Original | Tuned |
+|---|---:|---:|
+| Overall frame agreement | 79.3% | **88.4%** |
+| Focused recall | 73.4% | **86.9%** |
+| Distraction recall | **96.6%** | 92.6% |
+| False negatives | 116 | **57** |
 
-| Metric | Old rule | Tuned rule |
-| --- | ---: | ---: |
-| Overall agreement | 79.3% | 88.4% |
-| Focused recall | 73.4% | 86.9% |
-| Distraction recall | 96.6% | 92.6% |
-| False negatives | 116 | 57 |
+On a held-out session:
 
-Held-out validation:
+- frame-level agreement was **84.5%**;
+- rolling-window agreement was **92.7%**;
+- look-down/look-right distraction recall was **98.4%**;
+- reaction time was under one captured frame.
 
-- frame-level agreement: 84.5%,
-- rolling-window agreement: 92.7%,
-- clean rolling-window agreement after removing one setup-geometry confound: 93.6%,
-- distraction recall for look-down and look-right: 98.4%,
-- reaction time: under one captured frame.
+These figures validate one device/setup protocol, not universal attention detection. They are useful because they expose the tradeoff: fewer unfair pauses cost some distraction recall.
 
-The validation set now gives us a way to evaluate future optimizations such as quantization, frame skipping, AOT compilation, or accelerator changes without guessing whether focus quality regressed.
+## User flow
 
-## Repository Structure
+1. Choose a pet, focus duration, and distracting apps.
+2. Grant camera access and explicitly enable the accessibility service.
+3. Position the phone near the study material.
+4. Hold a normal study posture during the 45-frame calibration.
+5. Study while the on-device pipeline updates the focus state.
+6. If attention is lost, the timer pauses; if a blocked app opens, EarnedIt returns to the foreground.
+7. Complete the focused duration to unlock the reward window and progression.
 
-```text
-focus-guard/
-  app/
-    build.gradle.kts
-    src/main/
-      AndroidManifest.xml
-      assets/
-        face_detector.tflite
-        face_landmark_detector.tflite
-        eyegaze.tflite
-      java/com/focusguard/
-        MainActivity.kt
-        instrumentation/
-        ml/
-        pet/
-        service/
-        session/
-        social/
-        state/
-        ui/
-      res/
-  docs/
-    accessibility-service-qa.md
-  supabase/
-    social_schema.sql
-  build.gradle.kts
-  settings.gradle.kts
-  gradlew
-  gradlew.bat
-```
+Optional social profiles and friend requests use Supabase. They are isolated from attention inference and show a configuration-needed state when no backend is configured.
 
-## Dependencies
+## Build and run
 
-Install these before building from scratch:
+### Requirements
 
-- Git
-- Android Studio Ladybug or newer, or Android command-line tools with SDK support
+- Android Studio Ladybug or newer
 - JDK 17
 - Android SDK 35
-- Android device or emulator with camera support
-- Recommended physical device: Samsung Galaxy S25 Ultra or another modern Snapdragon Android device
+- A local Gradle installation; the launcher scripts are present, but the wrapper metadata is not currently tracked
+- An ARM64 physical Android device with a front camera
 
-Gradle dependencies are declared in `app/build.gradle.kts` and are downloaded by the Gradle wrapper:
-
-- Kotlin Android plugin
-- Jetpack Compose and Material 3
-- CameraX
-- AndroidX lifecycle/navigation/datastore
-- Kotlin coroutines
-- Google LiteRT `com.google.ai.edge.litert:litert:2.1.0`
-
-Optional social features require a Supabase project and anon key.
-
-## Setup From Scratch
-
-1. Clone the repository.
-
-```powershell
-git clone https://github.com/sualharun/Earned.git
-cd Earned\focus-guard
+```bash
+git clone https://github.com/gabriel-xiong/FocusGuard.git
+cd FocusGuard
 ```
 
-2. Open the `focus-guard` folder in Android Studio.
-
-3. Confirm Android Studio is using JDK 17.
-
-4. Install Android SDK 35 if prompted.
-
-5. Sync Gradle.
-
-6. Optional: create `focus-guard/local.properties` for Supabase social features.
+Optional social configuration belongs in `local.properties`:
 
 ```properties
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
 ```
 
-If this file is omitted, the core focus app still works. Social actions show a configuration-needed state when the anon key is missing.
-
-7. Connect a physical Android device and enable developer options/USB debugging.
-
-8. Build the debug APK.
+The project uses AndroidX but does not currently track a root `gradle.properties`. Pass the property explicitly for a clean command-line build:
 
 ```powershell
-.\gradlew.bat :app:assembleDebug
+gradle "-Pandroid.useAndroidX=true" :app:compileDebugKotlin
+gradle "-Pandroid.useAndroidX=true" "-Dorg.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m" :app:assembleDebug
+gradle "-Pandroid.useAndroidX=true" "-Dorg.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m" :app:installDebug
 ```
 
-On macOS/Linux:
+On macOS or Linux, the same commands work without quoting the `-Pandroid.useAndroidX=true` argument. After installation, grant camera permission and enable **EarnedIt App Blocking** under Android Accessibility settings.
 
-```bash
-./gradlew :app:assembleDebug
-```
-
-## Run Instructions
-
-From Android Studio:
-
-1. Select the `app` run configuration.
-2. Select a connected Android device.
-3. Press Run.
-4. Grant camera permission when prompted.
-
-From the command line:
-
-```powershell
-.\gradlew.bat :app:installDebug
-```
-
-Then open EarnedIt from the launcher.
-
-## Usage Instructions
-
-1. Complete onboarding and choose a pet.
-2. Open the focus setup screen.
-3. Select a focus duration.
-4. Select distracting apps to block.
-5. Enable the accessibility service when prompted or manually:
-   - Android Settings
-   - Accessibility
-   - EarnedIt App Blocking
-   - Turn on
-6. Start a focus session.
-7. Hold the phone near the study target so the camera sees your face.
-8. Stay naturally focused while calibration collects 45 detected-face frames.
-9. Study normally.
-10. Look away, leave frame, or close your eyes to see the session pause.
-11. Try opening a blacklisted app to confirm EarnedIt bounces you back.
-12. Finish the focus timer to enter the reward window.
-
-Best results:
-
-- Put the phone close to the laptop/book/notebook you are actually using.
-- Keep your face visible during calibration.
-- Avoid calibrating while looking far away from the main study material.
-
-## Testing Instructions
-
-Compile check:
-
-```powershell
-.\gradlew.bat :app:compileDebugKotlin
-```
-
-Full debug build:
-
-```powershell
-.\gradlew.bat :app:assembleDebug
-```
-
-Accessibility-service manual QA:
+## Repository map
 
 ```text
-docs/accessibility-service-qa.md
+app/src/main/
+  assets/                         three LiteRT model files
+  java/com/focusguard/
+    ml/                           preprocessing, model wrappers, pose, and gaze
+    session/                      calibration, scoring, and session state
+    service/                      foreground-app accessibility service
+    instrumentation/              latency, system metrics, and quality capture
+    ui/                           Jetpack Compose screens
+    pet/                          reward and progression system
+    social/                       optional Supabase integration
+docs/accessibility-service-qa.md  blocking-service test matrix
+supabase/social_schema.sql        optional social schema
 ```
 
-Suggested device QA:
+## Current limitations
 
-1. Install the debug build on a physical device.
-2. Grant camera permission.
-3. Enable the Accessibility Service.
-4. Start a short focus session.
-5. Verify calibration completes.
-6. Verify timer counts down while focused.
-7. Verify timer pauses when face is missing or gaze is outside the tuned zone.
-8. Verify a blacklisted app returns the user to EarnedIt.
-9. Verify `com.android.dialer` is not blocked.
-10. Verify the reward window does not block selected apps.
+- Accuracy depends on lighting, face visibility, device angle, and desk geometry.
+- The reported validation is small and setup-specific; it does not establish demographic fairness or general population performance.
+- Attention is inferred from observable pose and eye signals, not comprehension or learning.
+- The app currently targets ARM64 and has been optimized around modern Snapdragon-class hardware.
+- Accessibility-based blocking requires explicit user trust and can be disabled by the operating system or user.
+- Reproducible wrapper metadata and a checked-in AndroidX Gradle property still need to be added.
+- Release hardening still needs broader device coverage, automated UI tests, battery profiling, and a formal privacy policy.
 
-Suggested instrumentation QA:
+## Project context
 
-1. Start a focus session.
-2. Enable recording mode from debug controls.
-3. Run a short scripted focused/distracted sequence.
-4. Pull files from app external storage.
-5. Inspect `quality_capture/<session_id>/manifest.json`.
-6. Inspect frame sidecars for yaw, pitch, confidence, and focused-zone values.
-7. Inspect benchmark JSON under `benchmarks/`.
-
-## Notes
-
-- Camera-based focus detection is sensitive to phone placement. The best setup is a phone position near the study material.
-- The tuned threshold was validated for the captured study setup. Different desk geometry can require future calibration or threshold work.
-- The package name remains `com.focusguard`, while the product UI/README uses EarnedIt.
-- The app uses NPU first but can fall back to GPU or CPU for reliability.
-- Social features are optional; focus detection and app blocking do not require network access.
-- The current app icon is Android's built-in compass icon.
-
-## Built At
-
-Google x Qualcomm Developer Hackathon. In collaboration with Rayan Ahmed, Sanjiv Saravanan, and Sual Harun. 
-
-## References
-
-- Google AI Edge LiteRT documentation: https://ai.google.dev/edge/litert
-- LiteRT Android/Kotlin APIs: https://ai.google.dev/edge/litert/android
-- Qualcomm AI Hub MediaPipe Face model family: https://aihub.qualcomm.com/models/mediapipe_face
-- Android CameraX documentation: https://developer.android.com/media/camera/camerax
-- Android Accessibility Service documentation: https://developer.android.com/guide/topics/ui/accessibility/service
-- Jetpack Compose documentation: https://developer.android.com/compose
-- Supabase REST/API documentation: https://supabase.com/docs
+FocusGuard was built with Rayan Ahmed, Sanjiv Saravanan, and Sual Harun for the Google × Qualcomm Developer Hackathon. The strongest engineering contribution is the measurement loop around the product: capture signals, label failure cases, tune a transparent decision rule, validate it on held-out data, and preserve an accelerator fallback for real devices.
