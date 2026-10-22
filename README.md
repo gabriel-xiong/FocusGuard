@@ -2,7 +2,7 @@
 
 FocusGuard is an Android study app that protects a focus session with fully on-device attention sensing. A three-model LiteRT pipeline estimates face presence, head pose, and eye state; the session state machine pauses distracted time; and an Accessibility Service blocks selected apps until the student returns.
 
-The product UI is currently branded **EarnedIt**. Camera frames used for attention detection remain on the device, and the core focus flow does not require a network connection.
+Camera frames used for attention detection remain on the device, and the core focus flow does not require a network connection.
 
 ## At a glance
 
