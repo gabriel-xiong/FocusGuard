@@ -17,26 +17,38 @@ Camera frames used for attention detection remain on the device, and the core fo
 
 ## System architecture
 
-```mermaid
-flowchart LR
-    C[CameraX front camera] --> P[Rotate, mirror, normalize]
-    P --> F[Face detector]
-    F --> L[468-point face landmarks]
-    L --> E[Eye crop + gaze model]
-    L --> H[Head-pose estimate]
-    E --> A[Calibrated AttentionSignal]
-    H --> A
-    A --> S[AttentionScorer]
-    S --> M[SessionManager state machine]
-    M --> U[Compose UI + timer]
-    M --> B[Accessibility app blocker]
-    M --> R[Rewards + pet progression]
+### On-device inference
 
-    N[NPU] -. fallback .-> G[GPU]
-    G -. fallback .-> X[CPU]
-    N --> F
-    N --> L
-    N --> E
+```mermaid
+flowchart TB
+    A["CameraX front camera"]
+    A --> B["Rotate, mirror, normalize"]
+    B --> C["Face detector"]
+    C --> D["468-point face landmarks"]
+    D --> E["Head-pose estimate"]
+    D --> F["Eye crop + gaze model"]
+    E --> G["Calibrated attention signal"]
+    F --> G
+    G --> H["Attention scorer"]
+```
+
+Each model attempts the fastest available delegate and falls back safely:
+
+```mermaid
+flowchart TB
+    N["NPU"] -->|fallback| G["GPU"]
+    G -->|fallback| C["CPU"]
+```
+
+### Product control loop
+
+```mermaid
+flowchart TB
+    A["Attention score"] --> C["SessionManager state machine"]
+    B["Foreground-app events"] --> C
+    C --> D["Compose UI + focus timer"]
+    C --> E["Accessibility app blocker"]
+    C --> F["Rewards + pet progression"]
 ```
 
 ## Engineering highlights
