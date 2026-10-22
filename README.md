@@ -8,7 +8,7 @@ Camera frames used for attention detection remain on the device, and the core fo
 
 | | |
 |---|---|
-| **Problem** | Keep the focus timer accurate when camera readings vary with lighting, phone position, and a student's natural study posture |
+| **Problem** | Help students stay focused during study sessions by detecting distraction and pausing the timer until they return |
 | **ML pipeline** | Face detection → 468-point landmarks → eye/gaze estimation → calibrated attention score |
 | **Runtime** | Google LiteRT with automatic NPU → GPU → CPU fallback |
 | **Measured result** | Threshold tuning reduced training-set false negatives from 116 to 57; held-out rolling-window agreement reached 92.7% |
